@@ -66,10 +66,16 @@ char WindowsVersionStr[128] = "Windows ";
 
 BOOL is_x64(void)
 {
+	PF_TYPE_DECL(WINAPI, BOOL, IsWow64Process, (HANDLE, PBOOL));
 	BOOL ret = FALSE;
 	// Detect if we're running a 32 or 64 bit system
 	if (sizeof(uintptr_t) < 8) {
-		IsWow64Process(GetCurrentProcess(), &ret);
+		PF_DECL_LOAD_LIBRARY(Kernel32);
+		PF_INIT(IsWow64Process, Kernel32);
+		if (pfIsWow64Process != NULL) {
+			(*pfIsWow64Process)(GetCurrentProcess(), &ret);
+		}
+		PF_FREE_LIBRARY(Kernel32);
 	} else {
 		ret = TRUE;
 	}
@@ -136,6 +142,12 @@ void GetWindowsVersion(void)
 			ws = (vi.wProductType <= VER_NT_WORKSTATION);
 			nWindowsVersion = vi.dwMajorVersion << 4 | vi.dwMinorVersion;
 			switch (nWindowsVersion) {
+			case 0x51: w = "XP";
+				break;
+			case 0x52: w = (!GetSystemMetrics(89) ? "2003" : "2003_R2");
+				break;
+			case 0x60: w = (ws ? "Vista" : "2008");
+				break;
 			case 0x61: w = (ws ? "7" : "2008_R2");
 				break;
 			case 0x62: w = (ws ? "8" : "2012");
@@ -148,7 +160,7 @@ void GetWindowsVersion(void)
 			case 0xA0: w = (ws ? "10" : "Server 10");
 				break;
 			default:
-				if (nWindowsVersion < 0x61)
+				if (nWindowsVersion < 0x51)
 					nWindowsVersion = WINDOWS_UNSUPPORTED;
 				else
 					w = "11 or later";
@@ -532,6 +544,12 @@ BOOL LIBWDI_API wdi_is_driver_supported(int driver_type, VS_FIXEDFILEINFO* drive
 	switch (driver_type) {
 	case WDI_WINUSB:
 #if defined(WDK_DIR)
+		// WinUSB is not supported  on Win2k/2k3
+		GET_WINDOWS_VERSION;
+		if ( (nWindowsVersion < WINDOWS_XP)
+		  || (nWindowsVersion == WINDOWS_2003) ) {
+			return FALSE;
+		}
 		return TRUE;
 #else
 		return FALSE;
@@ -702,7 +720,7 @@ int LIBWDI_API wdi_create_list(struct wdi_device_info** list,
 	MUTEX_START;
 
 	GET_WINDOWS_VERSION;
-	if (nWindowsVersion < WINDOWS_7) {
+	if (nWindowsVersion < WINDOWS_XP) {
 		wdi_err("This version of Windows is no longer supported");
 		r = WDI_ERROR_NOT_SUPPORTED;
 		goto out;
@@ -842,18 +860,35 @@ int LIBWDI_API wdi_create_list(struct wdi_device_info** list,
 		}
 		device_info->device_id = safe_strdup(strbuf);
 
-		// The information we want ("Bus reported device description") is accessed
-		// through DEVPKEY_Device_BusReportedDeviceDesc
-		desc[0] = 0;
-		if (!SetupDiGetDevicePropertyW(dev_info, &dev_info_data, &DEVPKEY_Device_BusReportedDeviceDesc,
-			&devprop_type, (BYTE*)desc, 2*MAX_DESC_LENGTH, &size, 0)) {
-			// fallback to SPDRP_DEVICEDESC (USB hubs still use it)
+		if (nWindowsVersion < WINDOWS_7) {
+			// On Vista and earlier we can use SPDRP_DEVICEDESC
 			if (!SetupDiGetDeviceRegistryPropertyW(dev_info, &dev_info_data, SPDRP_DEVICEDESC,
-				&reg_type, (BYTE*)desc, 2*MAX_DESC_LENGTH, &size) || (desc[0] == 0)) {
-				wdi_dbg("Could not read device description for %d: %s",
-					i, windows_error_str(0));
-				safe_swprintf(desc, MAX_DESC_LENGTH, L"Unknown Device #%d", unknown_count++);
+ 				&reg_type, (BYTE*)desc, 2*MAX_DESC_LENGTH, &size)) {
+				wdi_warn("could not read device description for %d: %s",
+ 					i, windows_error_str(0));
+ 				safe_swprintf(desc, MAX_DESC_LENGTH, L"Unknown Device #%d", unknown_count++);
 			}
+		} else {
+			// On Windows 7, the information we want ("Bus reported device description") is accessed
+			// through DEVPKEY_Device_BusReportedDeviceDesc
+			PF_DECL_LOAD_LIBRARY(SetupAPI);
+			PF_TYPE_DECL(WINAPI, BOOL, SetupDiGetDevicePropertyW,
+				(HDEVINFO, PSP_DEVINFO_DATA, const DEVPROPKEY*, DEVPROPTYPE*, PBYTE, DWORD, PDWORD, DWORD));
+			PF_INIT(SetupDiGetDevicePropertyW, SetupAPI);
+			if (pfSetupDiGetDevicePropertyW == NULL) {
+				wdi_warn("failed to locate SetupDiGetDevicePropertyW() in Setupapi.dll");
+				desc[0] = 0;
+			} else if (!pfSetupDiGetDevicePropertyW(dev_info, &dev_info_data, &DEVPKEY_Device_BusReportedDeviceDesc,
+				&devprop_type, (BYTE*)desc, 2*MAX_DESC_LENGTH, &size, 0)) {
+				// fallback to SPDRP_DEVICEDESC (USB hubs still use it)
+				if (!SetupDiGetDeviceRegistryPropertyW(dev_info, &dev_info_data, SPDRP_DEVICEDESC,
+					&reg_type, (BYTE*)desc, 2*MAX_DESC_LENGTH, &size) || (desc[0] == 0)) {
+					wdi_dbg("Could not read device description for %d: %s",
+						i, windows_error_str(0));
+					safe_swprintf(desc, MAX_DESC_LENGTH, L"Unknown Device #%d", unknown_count++);
+				}
+			}
+			PF_FREE_LIBRARY(SetupAPI);
 		}
 
 		device_info->is_composite = FALSE;	// non composite by default
@@ -1027,6 +1062,8 @@ static long tokenize_internal(const char* resource_name, char** dst, const token
 int LIBWDI_API wdi_prepare_driver(struct wdi_device_info* device_info, const char* path,
 								  const char* inf_name, struct wdi_options_prepare_driver* options)
 {
+	PF_DECL_LIBRARY(shell32);
+	PF_TYPE_DECL(WINAPI, BOOL, IsUserAnAdmin, (void));
 	const wchar_t bom = 0xFEFF;
 #if defined(ENABLE_DEBUG_LOGGING) || defined(INCLUDE_DEBUG_LOGGING)
 	const char* driver_display_name[WDI_NB_DRIVERS] = { "WinUSB", "libusb0.sys", "libusbK.sys", "Generic USB CDC", "user driver" };
@@ -1048,7 +1085,7 @@ int LIBWDI_API wdi_prepare_driver(struct wdi_device_info* device_info, const cha
 	MUTEX_START;
 
 	GET_WINDOWS_VERSION;
-	if (nWindowsVersion < WINDOWS_7) {
+	if (nWindowsVersion < WINDOWS_XP) {
 		wdi_err("This version of Windows is no longer supported");
 		r = WDI_ERROR_NOT_SUPPORTED;
 		goto out;
@@ -1279,7 +1316,9 @@ int LIBWDI_API wdi_prepare_driver(struct wdi_device_info* device_info, const cha
 	}
 	wdi_info("Successfully created '%s'", inf_path);
 
-	if (IsUserAnAdmin()) {
+	PF_LOAD_LIBRARY(shell32);
+	PF_INIT(IsUserAnAdmin, shell32);
+	if ( (nWindowsVersion >= WINDOWS_VISTA) && (pfIsUserAnAdmin != NULL) && (pfIsUserAnAdmin()) )  {
 		// Try to create and self-sign the cat file to remove security prompts
 		if ((options != NULL) && (options->disable_cat)) {
 			wdi_info(".cat generation disabled by user");
@@ -1331,11 +1370,12 @@ int LIBWDI_API wdi_prepare_driver(struct wdi_device_info* device_info, const cha
 		safe_free(cat_in_copy);
 		safe_free(dst);
 	} else {
-		wdi_info("No .cat file generated (missing elevated privileges)");
+		wdi_info("No .cat file generated (not running Vista or later, or missing elevated privileges)");
 	}
 	r = WDI_SUCCESS;
 
 out:
+	PF_FREE_LIBRARY(shell32);
 	CloseHandle(mutex);
 	return r;
 }
@@ -1438,6 +1478,8 @@ static int install_driver_internal(void* arglist)
 {
 	PF_DECL_LIBRARY(SetupAPI);
 	PF_TYPE_DECL(WINAPI, DWORD, CMP_WaitNoPendingInstallEvents, (DWORD));
+	PF_DECL_LIBRARY(shell32);
+	PF_TYPE_DECL(WINAPI, BOOL, IsUserAnAdmin, (void));
 	struct install_driver_params* params = (struct install_driver_params*)arglist;
 	SHELLEXECUTEINFOA shExecInfo;
 	STARTUPINFOA si;
@@ -1449,14 +1491,14 @@ static int install_driver_internal(void* arglist)
 	OVERLAPPED overlapped;
 	int r;
 	DWORD err, rd_count, to_read, offset, bufsize = LOGBUF_SIZE;
-	BOOL is_x64 = FALSE;
+	BOOL w64 = FALSE;
 	char *buffer = NULL, *new_buffer;
 	const char* filter_name = "libusb0";
 
 	MUTEX_START;
 
 	GET_WINDOWS_VERSION;
-	if (nWindowsVersion < WINDOWS_7) {
+	if (nWindowsVersion < WINDOWS_XP) {
 		wdi_err("This version of Windows is no longer supported");
 		r = WDI_ERROR_NOT_SUPPORTED;
 		goto out;
@@ -1465,7 +1507,6 @@ static int install_driver_internal(void* arglist)
 	PF_LOAD_LIBRARY(SetupAPI);
 	r = WDI_ERROR_RESOURCE;
 	PF_INIT_OR_OUT(CMP_WaitNoPendingInstallEvents, SetupAPI);
-
 	current_device = params->device_info;
 	filter_driver = FALSE;
 	if (params->options != NULL)
@@ -1500,13 +1541,7 @@ static int install_driver_internal(void* arglist)
 
 	// Detect whether if we should run the 64 bit installer, without
 	// relying on external libs
-	if (sizeof(uintptr_t) < 8) {
-		// This application is not 64 bit, but it might be 32 bit
-		// running in WOW64
-		IsWow64Process(GetCurrentProcess(), &is_x64);
-	} else {
-		is_x64 = TRUE;
-	}
+	w64 = is_x64();
 
 	// Use a pipe to communicate with our installer
 	pipe_handle = CreateNamedPipeA(INSTALLER_PIPE_NAME, PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED,
@@ -1529,11 +1564,11 @@ static int install_driver_internal(void* arglist)
 	if (!filter_driver) {
 		// Why do we need two installers? Glad you asked. If you try to run the x86 installer on an x64
 		// system, you will get a "System does not work under WOW64 and requires 64-bit version" message.
-		static_sprintf(exename, "\"%s\\installer_x%s.exe\"", path, is_x64?"64":"86");
+		static_sprintf(exename, "\"%s\\installer_x%s.exe\"", path, w64?"64":"86");
 		static_sprintf(exeargs, "\"%s\"", params->inf_name);
 	} else {
 		// Use libusb-win32's filter driver installer
-		static_sprintf(exename, "\"%s\\%s\\\\install-filter.exe\"", path, is_x64?"amd64":"x86");
+		static_sprintf(exename, "\"%s\\%s\\\\install-filter.exe\"", path, w64?"amd64":"x86");
 		if (safe_stricmp(current_device->upper_filter, filter_name) == 0) {
 			// Device already has the libusb-win32 filter => remove
 			static_strcpy(exeargs, "uninstall -d=");
@@ -1556,18 +1591,20 @@ static int install_driver_internal(void* arglist)
 	// At this stage, if either the 32 or 64 bit installer version is missing,
 	// it is the application developer's fault...
 	if (GetFileAttributesU(exename) == INVALID_FILE_ATTRIBUTES) {
-		wdi_err("This application does not contain the required %s bit installer", is_x64?"64":"32");
-		wdi_err("Please contact the application provider for a %s bit compatible version", is_x64?"64":"32");
+		wdi_err("This application does not contain the required %s bit installer", w64?"64":"32");
+		wdi_err("Please contact the application provider for a %s bit compatible version", w64?"64":"32");
 		r = WDI_ERROR_NOT_FOUND; goto out;
 	}
 
-	if (IsUserAnAdmin()) {
-		// Take care of UAC with ShellExecuteEx + runas
+	PF_LOAD_LIBRARY(shell32);
+	PF_INIT(IsUserAnAdmin, shell32);
+	if ( (nWindowsVersion >= WINDOWS_VISTA) && (pfIsUserAnAdmin != NULL) && (pfIsUserAnAdmin()) )  {
+		// On Vista and later, we must take care of UAC with ShellExecuteEx + runas
 		shExecInfo.cbSize = sizeof(SHELLEXECUTEINFOA);
 		shExecInfo.fMask = SEE_MASK_NOCLOSEPROCESS;
 		shExecInfo.hwnd = NULL;
 		shExecInfo.lpVerb = "runas";
-		shExecInfo.lpFile = filter_driver?"install-filter.exe":(is_x64?"installer_x64.exe":"installer_x86.exe");
+		shExecInfo.lpFile = filter_driver?"install-filter.exe":(w64?"installer_x64.exe":"installer_x86.exe");
 		shExecInfo.lpParameters = exeargs;
 		shExecInfo.lpDirectory = path;
 		shExecInfo.lpClass = NULL;
@@ -1598,7 +1635,7 @@ static int install_driver_internal(void* arglist)
 
 		handle[1] = shExecInfo.hProcess;
 	} else {
-		// If app is already elevated, simply use CreateProcess()
+		// On XP and earlier, or if app is already elevated, simply use CreateProcess
 		memset(&si, 0, sizeof(si));
 		si.cb = sizeof(si);
 		if (filter_driver) {
@@ -1720,6 +1757,7 @@ out:
 	safe_closehandle(handle[0]);
 	safe_closehandle(pipe_handle);
 	safe_closehandle(stdout_w);
+	PF_FREE_LIBRARY(shell32);
 	PF_FREE_LIBRARY(SetupAPI);
 	CloseHandle(mutex);
 	return r;
@@ -1747,12 +1785,14 @@ int LIBWDI_API wdi_install_driver(struct wdi_device_info* device_info, const cha
 int LIBWDI_API wdi_install_trusted_certificate(const char* cert_name,
 											   struct wdi_options_install_cert* options)
 {
+	PF_DECL_LIBRARY(shell32);
+	PF_TYPE_DECL(WINAPI, BOOL, IsUserAnAdmin, (void));
 	int i, r;
 	HWND hWnd = NULL;
 	BOOL disable_warning = FALSE;
 
 	GET_WINDOWS_VERSION;
-	if (nWindowsVersion < WINDOWS_7) {
+	if (nWindowsVersion < WINDOWS_XP) {
 		wdi_err("This version of Windows is no longer supported");
 		r = WDI_ERROR_NOT_SUPPORTED;
 		goto out;
@@ -1763,7 +1803,9 @@ int LIBWDI_API wdi_install_trusted_certificate(const char* cert_name,
 		goto out;
 	}
 
-	if (IsUserAnAdmin()) {
+	PF_LOAD_LIBRARY(shell32);
+	PF_INIT(IsUserAnAdmin, shell32);
+	if ( (nWindowsVersion < WINDOWS_VISTA) || ((pfIsUserAnAdmin != NULL) && pfIsUserAnAdmin()) ) {
 		for (i=0; i<nb_resources; i++) {
 			if (safe_strcmp(cert_name, resource[i].name) == 0) {
 				break;
@@ -1790,9 +1832,10 @@ int LIBWDI_API wdi_install_trusted_certificate(const char* cert_name,
 		goto out;
 	}
 
-	wdi_err("This call must be run with elevated privileges");
+	wdi_err("This call must be run with elevated privileges on Vista and later");
 	r = WDI_ERROR_NEEDS_ADMIN;
 out:
+	PF_FREE_LIBRARY(shell32);
 	return r;
 }
 

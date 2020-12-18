@@ -269,7 +269,8 @@ LIBWDI_EXP int LIBWDI_API wdi_install_driver(struct wdi_device_info* device_info
 
 /*
  * Install a code signing certificate (from embedded resources) into
- * the Trusted Publisher repository. Requires elevated privileges.
+ * the Trusted Publisher repository. Requires elevated privileges when
+ * running the application on Vista and later.
  */
 LIBWDI_EXP int LIBWDI_API wdi_install_trusted_certificate(const char* cert_name,
 														  struct wdi_options_install_cert* options);
